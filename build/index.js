@@ -1,265 +1,31 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, } from '@modelcontextprotocol/sdk/types.js';
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
-import Redis from 'redis';
 import axios from 'axios';
-import 'isomorphic-fetch';
 class MyntraSellerMCPServer {
     server;
-    app;
-    redis;
     sellerTokens = new Map();
     myntraApiBase;
     constructor() {
-        this.app = express();
         this.myntraApiBase = process.env.MYNTRA_API_BASE || 'https://api.myntra.com/seller';
-        this.setupRedis();
-        this.setupExpress();
-        this.setupMCPServer();
-        this.setupToolHandlers();
-    }
-    async setupRedis() {
-        if (process.env.REDIS_URL) {
-            this.redis = Redis.createClient({
-                url: process.env.REDIS_URL,
-                socket: {
-                    reconnectStrategy: (retries) => Math.min(retries * 50, 500)
-                }
-            });
-            this.redis.on('error', (err) => {
-                console.error('Redis Client Error', err);
-            });
-            await this.redis.connect();
-            console.log('Connected to Redis for token storage');
-        }
-        else {
-            console.log('No Redis URL provided, using in-memory token storage');
-        }
-    }
-    setupExpress() {
-        this.app.set('trust proxy', 1);
-        this.app.use(helmet({
-            crossOriginEmbedderPolicy: false,
-            contentSecurityPolicy: {
-                directives: {
-                    defaultSrc: ["'self'"],
-                    styleSrc: ["'self'", "'unsafe-inline'"],
-                    scriptSrc: ["'self'"],
-                    connectSrc: ["'self'", "https://api.myntra.com"],
-                },
-            },
-        }));
-        this.app.use(cors({
-            origin: (origin, callback) => {
-                const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
-                    'https://claude.ai',
-                    'https://chatgpt.com',
-                    'http://localhost:3000'
-                ];
-                if (!origin || allowedOrigins.includes(origin)) {
-                    callback(null, true);
-                }
-                else {
-                    callback(new Error('Not allowed by CORS'));
-                }
-            },
-            credentials: true,
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin'],
-        }));
-        const limiter = rateLimit({
-            windowMs: 15 * 60 * 1000,
-            max: 1000,
-            message: {
-                error: 'Too many requests from this IP',
-                retryAfter: 15 * 60
-            },
-            standardHeaders: true,
-            legacyHeaders: false,
-        });
-        this.app.use(limiter);
-        this.app.use(express.json({ limit: '10mb' }));
-        this.app.use(express.urlencoded({ extended: true }));
-        // Health check endpoint
-        this.app.get('/health', (req, res) => {
-            res.status(200).json({
-                status: 'healthy',
-                timestamp: new Date().toISOString(),
-                version: process.env.npm_package_version || '1.0.0',
-                environment: process.env.NODE_ENV || 'development',
-                uptime: process.uptime(),
-                memory: process.memoryUsage(),
-            });
-        });
-        // Readiness check
-        this.app.get('/ready', async (req, res) => {
-            try {
-                if (this.redis) {
-                    await this.redis.ping();
-                }
-                res.status(200).json({ status: 'ready' });
-            }
-            catch (error) {
-                res.status(503).json({ status: 'not ready', error: error.message });
-            }
-        });
-        // Metrics endpoint
-        this.app.get('/metrics', (req, res) => {
-            const metrics = {
-                nodejs_memory_usage_bytes: process.memoryUsage(),
-                nodejs_uptime_seconds: process.uptime(),
-                http_requests_total: res.get('X-Request-Count') || 0,
-                active_connections: this.sellerTokens.size,
-            };
-            res.set('Content-Type', 'text/plain');
-            res.send(Object.entries(metrics).map(([key, value]) => typeof value === 'object'
-                ? Object.entries(value).map(([k, v]) => `${key}_{${k}} ${v}`).join('\n')
-                : `${key} ${value}`).join('\n'));
-        });
-        // Authentication endpoints
-        this.app.post('/auth/login', async (req, res) => {
-            const { sellerId, apiKey, apiSecret } = req.body;
-            if (!sellerId || !apiKey || !apiSecret) {
-                res.status(400).json({
-                    error: 'Missing required fields',
-                    required: ['sellerId', 'apiKey', 'apiSecret'],
-                    timestamp: new Date().toISOString()
-                });
-                return;
-            }
-            try {
-                // Authenticate with Myntra API
-                const response = await axios.post(`${this.myntraApiBase}/auth/token`, {
-                    seller_id: sellerId,
-                    api_key: apiKey,
-                    api_secret: apiSecret,
-                });
-                const tokens = {
-                    accessToken: response.data.access_token,
-                    refreshToken: response.data.refresh_token,
-                    expiresOn: Date.now() + (response.data.expires_in * 1000),
-                    sellerId: sellerId,
-                };
-                await this.storeTokens(sellerId, tokens);
-                res.status(200).json({
-                    success: true,
-                    message: 'Authentication successful',
-                    sellerId: sellerId,
-                    expiresIn: response.data.expires_in,
-                    timestamp: new Date().toISOString()
-                });
-            }
-            catch (error) {
-                console.error('Authentication error:', error);
-                res.status(401).json({
-                    error: 'Authentication failed',
-                    details: error.response?.data?.message || error.message,
-                    timestamp: new Date().toISOString()
-                });
-            }
-        });
-        // Get authentication status
-        this.app.get('/auth/status/:sellerId', async (req, res) => {
-            try {
-                const { sellerId } = req.params;
-                const isAuthenticated = await this.checkAuthentication(sellerId);
-                if (isAuthenticated) {
-                    const tokens = await this.getTokens(sellerId);
-                    res.json({
-                        authenticated: true,
-                        sellerId: tokens?.sellerId,
-                        expiresIn: tokens?.expiresOn ? Math.floor((tokens.expiresOn - Date.now()) / 1000) : 0,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                else {
-                    res.json({
-                        authenticated: false,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-            }
-            catch (error) {
-                res.status(500).json({
-                    error: 'Failed to check authentication status',
-                    details: error.message,
-                    timestamp: new Date().toISOString()
-                });
-            }
-        });
-        // Revoke authentication
-        this.app.post('/auth/logout/:sellerId', async (req, res) => {
-            try {
-                const { sellerId } = req.params;
-                await this.revokeTokens(sellerId);
-                res.json({
-                    success: true,
-                    message: 'Logged out successfully',
-                    timestamp: new Date().toISOString()
-                });
-            }
-            catch (error) {
-                res.status(500).json({
-                    error: 'Failed to logout',
-                    details: error.message,
-                    timestamp: new Date().toISOString()
-                });
-            }
-        });
-    }
-    setupMCPServer() {
         this.server = new Server({
             name: 'myntra-seller-mcp-server',
-            version: process.env.npm_package_version || '1.0.0',
+            version: '1.0.0',
         }, {
             capabilities: {
                 tools: {},
             },
         });
+        this.setupToolHandlers();
     }
     async storeTokens(sellerId, tokens) {
-        if (this.redis) {
-            try {
-                await this.redis.setEx(`myntra_tokens:${sellerId}`, 3600 * 24 * 7, JSON.stringify(tokens));
-            }
-            catch (error) {
-                console.error('Failed to store tokens in Redis:', error);
-                this.sellerTokens.set(sellerId, tokens);
-            }
-        }
-        else {
-            this.sellerTokens.set(sellerId, tokens);
-        }
+        this.sellerTokens.set(sellerId, tokens);
     }
     async getTokens(sellerId) {
-        if (this.redis) {
-            try {
-                const tokensData = await this.redis.get(`myntra_tokens:${sellerId}`);
-                return tokensData ? JSON.parse(tokensData) : null;
-            }
-            catch (error) {
-                console.error('Failed to get tokens from Redis:', error);
-                return this.sellerTokens.get(sellerId) || null;
-            }
-        }
-        else {
-            return this.sellerTokens.get(sellerId) || null;
-        }
+        return this.sellerTokens.get(sellerId) || null;
     }
     async revokeTokens(sellerId) {
-        if (this.redis) {
-            try {
-                await this.redis.del(`myntra_tokens:${sellerId}`);
-            }
-            catch (error) {
-                console.error('Failed to delete tokens from Redis:', error);
-            }
-        }
         this.sellerTokens.delete(sellerId);
     }
     async checkAuthentication(sellerId) {
@@ -359,30 +125,16 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
                                 status: {
                                     type: 'string',
                                     enum: ['active', 'inactive', 'pending', 'rejected', 'all'],
                                     description: 'Filter by product status',
                                     default: 'all'
                                 },
-                                category: {
-                                    type: 'string',
-                                    description: 'Filter by category'
-                                },
-                                limit: {
-                                    type: 'number',
-                                    description: 'Maximum products to return',
-                                    default: 50
-                                },
-                                offset: {
-                                    type: 'number',
-                                    description: 'Offset for pagination',
-                                    default: 0
-                                },
+                                category: { type: 'string', description: 'Filter by category' },
+                                limit: { type: 'number', description: 'Maximum products to return', default: 50 },
+                                offset: { type: 'number', description: 'Offset for pagination', default: 0 },
                             },
                             required: ['seller_id']
                         }
@@ -393,14 +145,8 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                product_id: {
-                                    type: 'string',
-                                    description: 'Product SKU or ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                product_id: { type: 'string', description: 'Product SKU or ID' },
                             },
                             required: ['seller_id', 'product_id']
                         }
@@ -411,42 +157,15 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                sku: {
-                                    type: 'string',
-                                    description: 'Product SKU'
-                                },
-                                name: {
-                                    type: 'string',
-                                    description: 'Product name'
-                                },
-                                brand: {
-                                    type: 'string',
-                                    description: 'Brand name'
-                                },
-                                category: {
-                                    type: 'string',
-                                    description: 'Product category'
-                                },
-                                description: {
-                                    type: 'string',
-                                    description: 'Product description'
-                                },
-                                mrp: {
-                                    type: 'number',
-                                    description: 'Maximum Retail Price'
-                                },
-                                selling_price: {
-                                    type: 'number',
-                                    description: 'Selling price'
-                                },
-                                inventory: {
-                                    type: 'number',
-                                    description: 'Available inventory'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                sku: { type: 'string', description: 'Product SKU' },
+                                name: { type: 'string', description: 'Product name' },
+                                brand: { type: 'string', description: 'Brand name' },
+                                category: { type: 'string', description: 'Product category' },
+                                description: { type: 'string', description: 'Product description' },
+                                mrp: { type: 'number', description: 'Maximum Retail Price' },
+                                selling_price: { type: 'number', description: 'Selling price' },
+                                inventory: { type: 'number', description: 'Available inventory' },
                                 images: {
                                     type: 'array',
                                     items: { type: 'string' },
@@ -462,14 +181,8 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                product_id: {
-                                    type: 'string',
-                                    description: 'Product SKU or ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                product_id: { type: 'string', description: 'Product SKU or ID' },
                                 updates: {
                                     type: 'object',
                                     description: 'Fields to update (e.g., {selling_price: 999, inventory: 50})'
@@ -484,18 +197,9 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                product_id: {
-                                    type: 'string',
-                                    description: 'Product SKU or ID'
-                                },
-                                quantity: {
-                                    type: 'number',
-                                    description: 'New inventory quantity'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                product_id: { type: 'string', description: 'Product SKU or ID' },
+                                quantity: { type: 'number', description: 'New inventory quantity' },
                             },
                             required: ['seller_id', 'product_id', 'quantity']
                         }
@@ -506,29 +210,16 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
                                 status: {
                                     type: 'string',
                                     enum: ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled', 'returned', 'all'],
                                     description: 'Filter by order status',
                                     default: 'all'
                                 },
-                                from_date: {
-                                    type: 'string',
-                                    description: 'Start date (YYYY-MM-DD)'
-                                },
-                                to_date: {
-                                    type: 'string',
-                                    description: 'End date (YYYY-MM-DD)'
-                                },
-                                limit: {
-                                    type: 'number',
-                                    description: 'Maximum orders to return',
-                                    default: 50
-                                },
+                                from_date: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+                                to_date: { type: 'string', description: 'End date (YYYY-MM-DD)' },
+                                limit: { type: 'number', description: 'Maximum orders to return', default: 50 },
                             },
                             required: ['seller_id']
                         }
@@ -539,14 +230,8 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                order_id: {
-                                    type: 'string',
-                                    description: 'Order ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                order_id: { type: 'string', description: 'Order ID' },
                             },
                             required: ['seller_id', 'order_id']
                         }
@@ -557,27 +242,15 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                order_id: {
-                                    type: 'string',
-                                    description: 'Order ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                order_id: { type: 'string', description: 'Order ID' },
                                 status: {
                                     type: 'string',
                                     enum: ['ready_to_ship', 'shipped', 'cancelled'],
                                     description: 'New order status'
                                 },
-                                tracking_id: {
-                                    type: 'string',
-                                    description: 'Tracking ID (required for shipped status)'
-                                },
-                                courier_partner: {
-                                    type: 'string',
-                                    description: 'Courier partner name'
-                                },
+                                tracking_id: { type: 'string', description: 'Tracking ID (required for shipped status)' },
+                                courier_partner: { type: 'string', description: 'Courier partner name' },
                             },
                             required: ['seller_id', 'order_id', 'status']
                         }
@@ -588,21 +261,14 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
                                 status: {
                                     type: 'string',
                                     enum: ['pending', 'approved', 'rejected', 'completed', 'all'],
                                     description: 'Filter by return status',
                                     default: 'pending'
                                 },
-                                limit: {
-                                    type: 'number',
-                                    description: 'Maximum returns to return',
-                                    default: 25
-                                },
+                                limit: { type: 'number', description: 'Maximum returns to return', default: 25 },
                             },
                             required: ['seller_id']
                         }
@@ -613,23 +279,14 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
-                                return_id: {
-                                    type: 'string',
-                                    description: 'Return request ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
+                                return_id: { type: 'string', description: 'Return request ID' },
                                 action: {
                                     type: 'string',
                                     enum: ['approve', 'reject'],
                                     description: 'Action to take'
                                 },
-                                reason: {
-                                    type: 'string',
-                                    description: 'Reason for rejection (if applicable)'
-                                },
+                                reason: { type: 'string', description: 'Reason for rejection (if applicable)' },
                             },
                             required: ['seller_id', 'return_id', 'action']
                         }
@@ -640,24 +297,15 @@ class MyntraSellerMCPServer {
                         inputSchema: {
                             type: 'object',
                             properties: {
-                                seller_id: {
-                                    type: 'string',
-                                    description: 'Seller ID'
-                                },
+                                seller_id: { type: 'string', description: 'Seller ID' },
                                 metric: {
                                     type: 'string',
                                     enum: ['sales', 'orders', 'revenue', 'top_products', 'inventory_health'],
                                     description: 'Metric to retrieve',
                                     default: 'sales'
                                 },
-                                from_date: {
-                                    type: 'string',
-                                    description: 'Start date (YYYY-MM-DD)'
-                                },
-                                to_date: {
-                                    type: 'string',
-                                    description: 'End date (YYYY-MM-DD)'
-                                },
+                                from_date: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+                                to_date: { type: 'string', description: 'End date (YYYY-MM-DD)' },
                             },
                             required: ['seller_id', 'metric']
                         }
@@ -714,7 +362,6 @@ class MyntraSellerMCPServer {
                     isError: true
                 };
             }
-            // Check if already authenticated
             if (await this.checkAuthentication(seller_id)) {
                 return {
                     content: [{
@@ -723,7 +370,6 @@ class MyntraSellerMCPServer {
                         }]
                 };
             }
-            // Authenticate with Myntra API
             const response = await axios.post(`${this.myntraApiBase}/auth/token`, {
                 seller_id,
                 api_key,
@@ -870,14 +516,7 @@ class MyntraSellerMCPServer {
     async createProduct(args) {
         const { seller_id, sku, name, brand, category, description, mrp, selling_price, inventory, images } = args;
         const productData = {
-            sku,
-            name,
-            brand,
-            category,
-            description,
-            mrp,
-            selling_price,
-            inventory,
+            sku, name, brand, category, description, mrp, selling_price, inventory,
             images: images || [],
         };
         const data = await this.makeApiRequest(seller_id, 'POST', '/products', productData);
@@ -901,9 +540,7 @@ class MyntraSellerMCPServer {
     }
     async updateInventory(args) {
         const { seller_id, product_id, quantity } = args;
-        const data = await this.makeApiRequest(seller_id, 'PATCH', `/products/${product_id}/inventory`, {
-            quantity
-        });
+        const data = await this.makeApiRequest(seller_id, 'PATCH', `/products/${product_id}/inventory`, { quantity });
         return {
             content: [{
                     type: 'text',
@@ -1085,44 +722,9 @@ class MyntraSellerMCPServer {
         };
     }
     async run() {
-        const port = process.env.PORT || 9093;
-        // Setup MCP SSE endpoint
-        this.app.get('/mcp', (req, res) => {
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Access-Control-Allow-Headers', 'Cache-Control');
-            const transport = new SSEServerTransport('/mcp', res);
-            this.server.connect(transport);
-        });
-        // Global error handler
-        this.app.use((error, req, res, next) => {
-            console.error('Global error handler:', error);
-            res.status(500).json({
-                error: 'Internal server error',
-                message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong',
-                timestamp: new Date().toISOString()
-            });
-        });
-        // Start HTTP server
-        this.app.listen(port, () => {
-            console.log(`Myntra Seller MCP Server running on port ${port}`);
-            console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-            console.log(`MCP endpoint: http://localhost:${port}/mcp`);
-        });
-        // Graceful shutdown
-        process.on('SIGTERM', async () => {
-            console.log('SIGTERM received, shutting down gracefully');
-            if (this.redis) {
-                await this.redis.disconnect();
-            }
-            process.exit(0);
-        });
-        process.on('SIGINT', async () => {
-            console.log('SIGINT received, shutting down gracefully');
-            if (this.redis) {
-                await this.redis.disconnect();
-            }
-            process.exit(0);
-        });
+        const transport = new StdioServerTransport();
+        await this.server.connect(transport);
+        console.error('Myntra Seller MCP Server running on stdio');
     }
 }
 // Start the server
